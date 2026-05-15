@@ -82,7 +82,7 @@ def call_gemini_api(messages: list[dict], system: str = SYSTEM_PROMPT) -> dict:
         },
     }
 
-    model = "gemini-2.0-flash"
+    model = "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 
     data = json.dumps(payload).encode("utf-8")
