@@ -1,6 +1,5 @@
 """
 LLM Client — calls Google Gemini API to generate answers from RAG context
-Uses: gemini-2.0-flash via generateContent REST endpoint (no SDK required)
 """
 
 import os
@@ -21,12 +20,9 @@ Your answers must:
 6. Use appropriate scientific terminology while remaining accessible
 7. Include dates, measurements, and specific details when available in context
 
-Format your answers clearly. Use bullet points for lists of instruments/objectives.
-Use bold for mission names and key findings. Always end with the cited sources."""
-
-
-GEMINI_MODEL    = "gemini-2.0-flash"
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+Format your answers clearly. Use bullet points for lists of instruments/objectives. 
+Use bold for mission names and key findings. Always end with the cited sources.
+"""
 
 
 def build_rag_prompt(query: str, context: str) -> str:
@@ -38,38 +34,13 @@ def build_rag_prompt(query: str, context: str) -> str:
 
 User Question: {query}
 
-Please answer the question using the context above. Cite sources as [Source N] inline."""
+Please answer the question using the context above. Cite sources as [Source N] inline.
+"""
 
 
-def _build_contents(chat_history: list[dict], query: str, context: str) -> list[dict]:
+def call_gemini_api(messages: list[dict], system: str = SYSTEM_PROMPT) -> dict:
     """
-    Build Gemini-format 'contents' array.
-    Gemini roles are 'user' / 'model' (not 'assistant').
-    Prior history is included for multi-turn memory.
-    The final turn contains the RAG-augmented prompt.
-    """
-    contents = []
-
-    for msg in chat_history:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}],
-        })
-
-    # Final RAG-augmented user turn
-    contents.append({
-        "role": "user",
-        "parts": [{"text": build_rag_prompt(query, context)}],
-    })
-
-    return contents
-
-
-def call_gemini_api(chat_history: list[dict], query: str, context: str,
-                    system: str = SYSTEM_PROMPT) -> dict:
-    """
-    POST to Gemini generateContent endpoint.
+    Call the Google Gemini REST API.
     Returns {"success": bool, "text": str, "error": str}
     """
     api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -77,55 +48,72 @@ def call_gemini_api(chat_history: list[dict], query: str, context: str,
         return {
             "success": False,
             "text": "",
-            "error": (
-                "GEMINI_API_KEY not set.\n"
-                "Get a free key at: https://aistudio.google.com/apikey\n"
-                "Then set it in the sidebar or run:  export GEMINI_API_KEY=your_key"
-            ),
+            "error": "GEMINI_API_KEY not set. Please set it in your environment variables.",
         }
 
+    # Convert messages from OpenAI/Claude format to Gemini format
+    # Gemini uses "user" and "model" roles, with "parts" instead of "content"
+    gemini_contents = []
+    for msg in messages:
+        role = msg["role"]
+        if role == "assistant":
+            role = "model"  # Gemini uses "model" instead of "assistant"
+        gemini_contents.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}],
+        })
+
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system}]
+        "contents": gemini_contents,
+        "systemInstruction": {
+            "parts": [{"text": system}],
         },
-        "contents": _build_contents(chat_history, query, context),
         "generationConfig": {
             "maxOutputTokens": 1024,
-            "temperature": 0.2,
+            "temperature": 0.7,
         },
     }
 
-    url  = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={api_key}"
+    model = "gemini-2.0-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
     data = json.dumps(payload).encode("utf-8")
-    req  = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"},
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+        },
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            # Gemini response: result["candidates"][0]["content"]["parts"][0]["text"]
             text = result["candidates"][0]["content"]["parts"][0]["text"]
             return {"success": True, "text": text, "error": ""}
-
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8")
-        try:
-            msg = json.loads(body).get("error", {}).get("message", body)
-        except Exception:
-            msg = body
-        return {"success": False, "text": "", "error": f"HTTP {e.code}: {msg}"}
-
+        error_body = e.read().decode("utf-8")
+        return {"success": False, "text": "", "error": f"HTTP {e.code}: {error_body}"}
     except Exception as e:
         return {"success": False, "text": "", "error": str(e)}
 
 
 def generate_answer(query: str, context: str, chat_history: list[dict] = None) -> dict:
     """
-    Public entry point used by app.py and cli_demo.py.
-    chat_history: [{"role": "user"/"assistant", "content": str}, ...]
+    High-level function: build messages from history + current query, call API.
+    chat_history: list of {"role": "user"/"assistant", "content": str}
     """
-    history = (chat_history or [])[-6:]   # keep last 6 turns
-    return call_gemini_api(history, query, context)
+    messages = []
+
+    # Add prior turns (limit to last 6 turns to avoid token overflow)
+    if chat_history:
+        messages.extend(chat_history[-6:])
+
+    # Add current RAG prompt
+    messages.append({
+        "role": "user",
+        "content": build_rag_prompt(query, context),
+    })
+
+    return call_gemini_api(messages)
