@@ -44,12 +44,20 @@ def call_gemini_api(messages: list[dict], system: str = SYSTEM_PROMPT) -> dict:
     Returns {"success": bool, "text": str, "error": str}
     """
     api_key = os.environ.get("GEMINI_API_KEY", "")
+
+    # ── DEBUG: API key check ──────────────────────────────────────────────
     if not api_key:
+        print("[DEBUG] GEMINI_API_KEY is MISSING from environment variables.")
+        print(f"[DEBUG] Available env vars containing 'KEY': "
+              f"{[k for k in os.environ if 'KEY' in k.upper()]}")
         return {
             "success": False,
             "text": "",
             "error": "GEMINI_API_KEY not set. Please set it in your environment variables.",
         }
+
+    masked_key = api_key[:6] + "..." + api_key[-4:] if len(api_key) > 10 else "***"
+    print(f"[DEBUG] GEMINI_API_KEY found: {masked_key}  (length={len(api_key)})")
 
     # Convert messages from OpenAI/Claude format to Gemini format
     # Gemini uses "user" and "model" roles, with "parts" instead of "content"
@@ -78,6 +86,8 @@ def call_gemini_api(messages: list[dict], system: str = SYSTEM_PROMPT) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 
     data = json.dumps(payload).encode("utf-8")
+    print(f"[DEBUG] Request → model={model}  payload_size={len(data)} bytes  messages={len(messages)}")
+
     req = urllib.request.Request(
         url,
         data=data,
@@ -89,13 +99,42 @@ def call_gemini_api(messages: list[dict], system: str = SYSTEM_PROMPT) -> dict:
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            result = json.loads(raw)
+            print(f"[DEBUG] Response OK — candidates={len(result.get('candidates', []))}")
+
+            # Check for blocked / empty responses
+            if not result.get("candidates"):
+                block_reason = result.get("promptFeedback", {}).get("blockReason", "unknown")
+                print(f"[DEBUG] No candidates returned. blockReason={block_reason}")
+                return {
+                    "success": False,
+                    "text": "",
+                    "error": f"Gemini returned no candidates. Block reason: {block_reason}",
+                }
+
             text = result["candidates"][0]["content"]["parts"][0]["text"]
             return {"success": True, "text": text, "error": ""}
+
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
-        return {"success": False, "text": "", "error": f"HTTP {e.code}: {error_body}"}
+        print(f"[DEBUG] HTTP Error {e.code} from Gemini API")
+        print(f"[DEBUG] Response body: {error_body[:1000]}")
+
+        # Try to parse structured error from Gemini
+        detail_msg = error_body
+        try:
+            err_json = json.loads(error_body)
+            detail_msg = err_json.get("error", {}).get("message", error_body)
+            err_status = err_json.get("error", {}).get("status", "")
+            print(f"[DEBUG] Error status={err_status}  message={detail_msg}")
+        except json.JSONDecodeError:
+            pass
+
+        return {"success": False, "text": "", "error": f"HTTP {e.code}: {detail_msg}"}
+
     except Exception as e:
+        print(f"[DEBUG] Unexpected exception: {type(e).__name__}: {e}")
         return {"success": False, "text": "", "error": str(e)}
 
 
