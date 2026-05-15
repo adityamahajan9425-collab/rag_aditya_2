@@ -1,5 +1,6 @@
 """
-LLM Client — calls Anthropic Claude API to generate answers from RAG context
+LLM Client — calls Google Gemini API to generate answers from RAG context
+Uses: gemini-2.0-flash via generateContent REST endpoint (no SDK required)
 """
 
 import os
@@ -20,9 +21,12 @@ Your answers must:
 6. Use appropriate scientific terminology while remaining accessible
 7. Include dates, measurements, and specific details when available in context
 
-Format your answers clearly. Use bullet points for lists of instruments/objectives. 
-Use bold for mission names and key findings. Always end with the cited sources.
-"""
+Format your answers clearly. Use bullet points for lists of instruments/objectives.
+Use bold for mission names and key findings. Always end with the cited sources."""
+
+
+GEMINI_MODEL    = "gemini-2.0-flash"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 def build_rag_prompt(query: str, context: str) -> str:
@@ -34,69 +38,94 @@ def build_rag_prompt(query: str, context: str) -> str:
 
 User Question: {query}
 
-Please answer the question using the context above. Cite sources as [Source N] inline.
-"""
+Please answer the question using the context above. Cite sources as [Source N] inline."""
 
 
-def call_claude_api(messages: list[dict], system: str = SYSTEM_PROMPT) -> dict:
+def _build_contents(chat_history: list[dict], query: str, context: str) -> list[dict]:
     """
-    Call the Anthropic Messages API.
+    Build Gemini-format 'contents' array.
+    Gemini roles are 'user' / 'model' (not 'assistant').
+    Prior history is included for multi-turn memory.
+    The final turn contains the RAG-augmented prompt.
+    """
+    contents = []
+
+    for msg in chat_history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}],
+        })
+
+    # Final RAG-augmented user turn
+    contents.append({
+        "role": "user",
+        "parts": [{"text": build_rag_prompt(query, context)}],
+    })
+
+    return contents
+
+
+def call_gemini_api(chat_history: list[dict], query: str, context: str,
+                    system: str = SYSTEM_PROMPT) -> dict:
+    """
+    POST to Gemini generateContent endpoint.
     Returns {"success": bool, "text": str, "error": str}
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         return {
             "success": False,
             "text": "",
-            "error": "ANTHROPIC_API_KEY not set. Please set it in your environment variables.",
+            "error": (
+                "GEMINI_API_KEY not set.\n"
+                "Get a free key at: https://aistudio.google.com/apikey\n"
+                "Then set it in the sidebar or run:  export GEMINI_API_KEY=your_key"
+            ),
         }
 
     payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1024,
-        "system": system,
-        "messages": messages,
+        "system_instruction": {
+            "parts": [{"text": system}]
+        },
+        "contents": _build_contents(chat_history, query, context),
+        "generationConfig": {
+            "maxOutputTokens": 1024,
+            "temperature": 0.2,
+        },
     }
 
+    url  = f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent?key={api_key}"
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
+    req  = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            text = result["content"][0]["text"]
+            # Gemini response: result["candidates"][0]["content"]["parts"][0]["text"]
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
             return {"success": True, "text": text, "error": ""}
+
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        return {"success": False, "text": "", "error": f"HTTP {e.code}: {error_body}"}
+        body = e.read().decode("utf-8")
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body)
+        except Exception:
+            msg = body
+        return {"success": False, "text": "", "error": f"HTTP {e.code}: {msg}"}
+
     except Exception as e:
         return {"success": False, "text": "", "error": str(e)}
 
 
 def generate_answer(query: str, context: str, chat_history: list[dict] = None) -> dict:
     """
-    High-level function: build messages from history + current query, call API.
-    chat_history: list of {"role": "user"/"assistant", "content": str}
+    Public entry point used by app.py and cli_demo.py.
+    chat_history: [{"role": "user"/"assistant", "content": str}, ...]
     """
-    messages = []
-
-    # Add prior turns (limit to last 6 turns to avoid token overflow)
-    if chat_history:
-        messages.extend(chat_history[-6:])
-
-    # Add current RAG prompt
-    messages.append({
-        "role": "user",
-        "content": build_rag_prompt(query, context),
-    })
-
-    return call_claude_api(messages)
+    history = (chat_history or [])[-6:]   # keep last 6 turns
+    return call_gemini_api(history, query, context)
